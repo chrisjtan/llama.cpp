@@ -895,252 +895,240 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
     ans = embeddings;
 
 
-    // struct ggml_tensor * W_q = ggml_view_2d(ctx0, model.head_attn_in_w, embed_dim, /*cols=*/embed_dim, /*offset=*/0);
-    // // struct ggml_tensor * qkv = ggml_mul_mat(ctx0, model.);
-    // struct ggml_tensor * Q = ggml_mul_mat(ctx0, model.head_attn_in_w, model.head_probe);
-    // Q = ggml_add(ctx0, Q, model.head_attn_in_b);
 
-    // struct ggml_tensor * KV =
-    //     ggml_add(ctx0, ggml_mul_mat(ctx0, model.head_attn_in_w, embeddings), model.head_attn_in_b);
+    // llava projector
+    {
+        // embeddings = ggml_reshape_2d(ctx0, embeddings, embeddings->ne[0], embeddings->ne[1]);
 
+        // struct ggml_tensor * patches = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 64);
+        // ggml_set_name(patches, "patches");
+        // ggml_set_input(patches);
 
+        // shape [1, 576, 1024]
+        // ne is whcn, ne = [1024, 576, 1, 1]
+        // embeddings = ggml_get_rows(ctx0, embeddings, patches);
 
-    
+        // print_tensor_info(embeddings, "embeddings");
 
+        // llava projector
+        if (ctx->proj_type == PROJECTOR_TYPE_MLP) {
+            embeddings = ggml_mul_mat(ctx0, model.mm_0_w, embeddings);
+            embeddings = ggml_add(ctx0, embeddings, model.mm_0_b);
 
-    // // llava projector
-    // {
-    //     // embeddings = ggml_reshape_2d(ctx0, embeddings, embeddings->ne[0], embeddings->ne[1]);
+            embeddings = ggml_gelu(ctx0, embeddings);
+            embeddings = ggml_mul_mat(ctx0, model.mm_2_w, embeddings);
+            embeddings = ggml_add(ctx0, embeddings, model.mm_2_b);
 
-    //     // struct ggml_tensor * patches = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 64);
-    //     // ggml_set_name(patches, "patches");
-    //     // ggml_set_input(patches);
+        } else if (ctx->proj_type == PROJECTOR_TYPE_MLP_NORM) {
+            embeddings = ggml_mul_mat(ctx0, model.mm_0_w, embeddings);
+            embeddings = ggml_add(ctx0, embeddings, model.mm_0_b);
+            // ggml_tensor_printf(embeddings, "mm_0_w",0,true,false);
+            // First LayerNorm
+            embeddings = ggml_norm(ctx0, embeddings, eps);
+            embeddings = ggml_add(ctx0, ggml_mul(ctx0, embeddings, model.mm_1_w),
+                                model.mm_1_b);
 
-    //     // shape [1, 576, 1024]
-    //     // ne is whcn, ne = [1024, 576, 1, 1]
-    //     // embeddings = ggml_get_rows(ctx0, embeddings, patches);
+            // GELU activation
+            embeddings = ggml_gelu(ctx0, embeddings);
 
-    //     // print_tensor_info(embeddings, "embeddings");
+            // Second linear layer
+            embeddings = ggml_mul_mat(ctx0, model.mm_3_w, embeddings);
+            embeddings = ggml_add(ctx0, embeddings, model.mm_3_b);
 
-    //     // llava projector
-    //     if (ctx->proj_type == PROJECTOR_TYPE_MLP) {
-    //         embeddings = ggml_mul_mat(ctx0, model.mm_0_w, embeddings);
-    //         embeddings = ggml_add(ctx0, embeddings, model.mm_0_b);
+            // Second LayerNorm
+            embeddings = ggml_norm(ctx0, embeddings, eps);
+            embeddings = ggml_add(ctx0, ggml_mul(ctx0, embeddings, model.mm_4_w),
+                                model.mm_4_b);
+        }
+        else if (ctx->proj_type == PROJECTOR_TYPE_LDP) {
+            // MobileVLM projector
+            int n_patch = 24;
+            struct ggml_tensor * mlp_1 = ggml_mul_mat(ctx0, model.mm_model_mlp_1_w, embeddings);
+            mlp_1 = ggml_add(ctx0, mlp_1, model.mm_model_mlp_1_b);
+            mlp_1 = ggml_gelu(ctx0, mlp_1);
+            struct ggml_tensor * mlp_3 = ggml_mul_mat(ctx0, model.mm_model_mlp_3_w, mlp_1);
+            mlp_3 = ggml_add(ctx0, mlp_3, model.mm_model_mlp_3_b);
+            // mlp_3 shape = [1, 576, 2048], ne = [2048, 576, 1, 1]
 
-    //         embeddings = ggml_gelu(ctx0, embeddings);
-    //         embeddings = ggml_mul_mat(ctx0, model.mm_2_w, embeddings);
-    //         embeddings = ggml_add(ctx0, embeddings, model.mm_2_b);
+            // block 1
+            struct ggml_tensor * block_1 = nullptr;
+            {
+                // transpose from [1, 576, 2048] --> [1, 2048, 576] --> [1, 2048, 24, 24]
+                mlp_3 = ggml_cont(ctx0, ggml_permute(ctx0, mlp_3, 1, 0, 2, 3));
+                mlp_3 = ggml_reshape_4d(ctx0, mlp_3, n_patch, n_patch, mlp_3->ne[1], mlp_3->ne[2]);
+                // stride = 1, padding = 1, bias is nullptr
+                block_1 = ggml_conv_depthwise_2d(ctx0, model.mm_model_block_1_block_0_0_w, mlp_3, 1, 1, 1, 1, 1, 1);
 
-    //     } else if (ctx->proj_type == PROJECTOR_TYPE_MLP_NORM) {
-    //         embeddings = ggml_mul_mat(ctx0, model.mm_0_w, embeddings);
-    //         embeddings = ggml_add(ctx0, embeddings, model.mm_0_b);
-    //         // ggml_tensor_printf(embeddings, "mm_0_w",0,true,false);
-    //         // First LayerNorm
-    //         embeddings = ggml_norm(ctx0, embeddings, eps);
-    //         embeddings = ggml_add(ctx0, ggml_mul(ctx0, embeddings, model.mm_1_w),
-    //                             model.mm_1_b);
+                // layer norm
+                // // block_1 shape = [1, 2048, 24, 24], ne = [24, 24, 2048, 1]
+                block_1 = ggml_cont(ctx0, ggml_permute(ctx0, block_1, 1, 2, 0, 3));
+                // block_1 shape = [1, 24, 24, 2048], ne = [2048, 24, 24, 1]
+                block_1 = ggml_norm(ctx0, block_1, eps);
+                block_1 = ggml_add(ctx0, ggml_mul(ctx0, block_1, model.mm_model_block_1_block_0_1_w), model.mm_model_block_1_block_0_1_b);
+                block_1 = ggml_cont(ctx0, ggml_permute(ctx0, block_1, 2, 0, 1, 3));
 
-    //         // GELU activation
-    //         embeddings = ggml_gelu(ctx0, embeddings);
+                // block_1 shape = [1, 2048, 24, 24], ne = [24, 24, 2048, 1]
+                // hardswish
+                struct ggml_tensor * block_1_hw = ggml_hardswish(ctx0, block_1);
 
-    //         // Second linear layer
-    //         embeddings = ggml_mul_mat(ctx0, model.mm_3_w, embeddings);
-    //         embeddings = ggml_add(ctx0, embeddings, model.mm_3_b);
+                block_1 = ggml_pool_2d(ctx0, block_1_hw, GGML_OP_POOL_AVG, block_1_hw->ne[0], block_1_hw->ne[1], block_1_hw->ne[0], block_1_hw->ne[1], 0, 0);
+                // block_1 shape = [1, 2048, 1, 1], ne = [1, 1, 2048, 1]
+                // pointwise conv
+                block_1 = ggml_reshape_2d(ctx0, block_1, block_1->ne[0]*block_1->ne[1]*block_1->ne[2], block_1->ne[3]);
+                block_1 = ggml_mul_mat(ctx0, model.mm_model_block_1_block_1_fc1_w, block_1);
+                block_1 = ggml_add(ctx0, block_1, model.mm_model_block_1_block_1_fc1_b);
+                block_1 = ggml_relu(ctx0, block_1);
+                block_1 = ggml_mul_mat(ctx0, model.mm_model_block_1_block_1_fc2_w, block_1);
+                block_1 = ggml_add(ctx0, block_1, model.mm_model_block_1_block_1_fc2_b);
+                block_1 = ggml_hardsigmoid(ctx0, block_1);
+                // block_1_hw shape = [1, 2048, 24, 24], ne = [24, 24, 2048, 1], block_1 shape = [1, 2048], ne = [2048, 1, 1, 1]
+                block_1 = ggml_reshape_4d(ctx0, block_1, 1, 1, block_1->ne[0], block_1->ne[1]);
+                block_1 = ggml_mul(ctx0, block_1_hw, block_1);
 
-    //         // Second LayerNorm
-    //         embeddings = ggml_norm(ctx0, embeddings, eps);
-    //         embeddings = ggml_add(ctx0, ggml_mul(ctx0, embeddings, model.mm_4_w),
-    //                             model.mm_4_b);
-    //     }
-    //     else if (ctx->proj_type == PROJECTOR_TYPE_LDP) {
-    //         // MobileVLM projector
-    //         int n_patch = 24;
-    //         struct ggml_tensor * mlp_1 = ggml_mul_mat(ctx0, model.mm_model_mlp_1_w, embeddings);
-    //         mlp_1 = ggml_add(ctx0, mlp_1, model.mm_model_mlp_1_b);
-    //         mlp_1 = ggml_gelu(ctx0, mlp_1);
-    //         struct ggml_tensor * mlp_3 = ggml_mul_mat(ctx0, model.mm_model_mlp_3_w, mlp_1);
-    //         mlp_3 = ggml_add(ctx0, mlp_3, model.mm_model_mlp_3_b);
-    //         // mlp_3 shape = [1, 576, 2048], ne = [2048, 576, 1, 1]
+                int w = block_1->ne[0], h = block_1->ne[1];
+                block_1 = ggml_reshape_3d(ctx0, block_1, w*h, block_1->ne[2], block_1->ne[3]);
+                block_1 = ggml_cont(ctx0, ggml_permute(ctx0, block_1, 1, 0, 2, 3));
 
-    //         // block 1
-    //         struct ggml_tensor * block_1 = nullptr;
-    //         {
-    //             // transpose from [1, 576, 2048] --> [1, 2048, 576] --> [1, 2048, 24, 24]
-    //             mlp_3 = ggml_cont(ctx0, ggml_permute(ctx0, mlp_3, 1, 0, 2, 3));
-    //             mlp_3 = ggml_reshape_4d(ctx0, mlp_3, n_patch, n_patch, mlp_3->ne[1], mlp_3->ne[2]);
-    //             // stride = 1, padding = 1, bias is nullptr
-    //             block_1 = ggml_conv_depthwise_2d(ctx0, model.mm_model_block_1_block_0_0_w, mlp_3, 1, 1, 1, 1, 1, 1);
+                // block_1 shape = [1, 24*24, 2048], ne = [24*24, 2048, 1]
+                block_1 = ggml_mul_mat(ctx0, model.mm_model_block_1_block_2_0_w, block_1);
+                block_1 = ggml_reshape_4d(ctx0, block_1, block_1->ne[0], w, h, block_1->ne[3]);
 
-    //             // layer norm
-    //             // // block_1 shape = [1, 2048, 24, 24], ne = [24, 24, 2048, 1]
-    //             block_1 = ggml_cont(ctx0, ggml_permute(ctx0, block_1, 1, 2, 0, 3));
-    //             // block_1 shape = [1, 24, 24, 2048], ne = [2048, 24, 24, 1]
-    //             block_1 = ggml_norm(ctx0, block_1, eps);
-    //             block_1 = ggml_add(ctx0, ggml_mul(ctx0, block_1, model.mm_model_block_1_block_0_1_w), model.mm_model_block_1_block_0_1_b);
-    //             block_1 = ggml_cont(ctx0, ggml_permute(ctx0, block_1, 2, 0, 1, 3));
+                // block_1 shape = [1, 24, 24, 2048], ne = [2048, 24, 24, 1]
+                block_1 = ggml_norm(ctx0, block_1, eps);
+                block_1 = ggml_add(ctx0, ggml_mul(ctx0, block_1, model.mm_model_block_1_block_2_1_w), model.mm_model_block_1_block_2_1_b);
+                block_1 = ggml_cont(ctx0, ggml_permute(ctx0, block_1, 2, 0, 1, 3));
+                // block1 shape = [1, 2048, 24, 24], ne = [24, 24, 2048, 1]
+                // residual
+                block_1 = ggml_add(ctx0, mlp_3, block_1);
+            }
 
-    //             // block_1 shape = [1, 2048, 24, 24], ne = [24, 24, 2048, 1]
-    //             // hardswish
-    //             struct ggml_tensor * block_1_hw = ggml_hardswish(ctx0, block_1);
+            // block_2
+            {
+                // stride = 2
+                block_1 = ggml_conv_depthwise_2d(ctx0, model.mm_model_block_2_block_0_0_w, block_1, 2, 2, 1, 1, 1, 1);
 
-    //             block_1 = ggml_pool_2d(ctx0, block_1_hw, GGML_OP_POOL_AVG, block_1_hw->ne[0], block_1_hw->ne[1], block_1_hw->ne[0], block_1_hw->ne[1], 0, 0);
-    //             // block_1 shape = [1, 2048, 1, 1], ne = [1, 1, 2048, 1]
-    //             // pointwise conv
-    //             block_1 = ggml_reshape_2d(ctx0, block_1, block_1->ne[0]*block_1->ne[1]*block_1->ne[2], block_1->ne[3]);
-    //             block_1 = ggml_mul_mat(ctx0, model.mm_model_block_1_block_1_fc1_w, block_1);
-    //             block_1 = ggml_add(ctx0, block_1, model.mm_model_block_1_block_1_fc1_b);
-    //             block_1 = ggml_relu(ctx0, block_1);
-    //             block_1 = ggml_mul_mat(ctx0, model.mm_model_block_1_block_1_fc2_w, block_1);
-    //             block_1 = ggml_add(ctx0, block_1, model.mm_model_block_1_block_1_fc2_b);
-    //             block_1 = ggml_hardsigmoid(ctx0, block_1);
-    //             // block_1_hw shape = [1, 2048, 24, 24], ne = [24, 24, 2048, 1], block_1 shape = [1, 2048], ne = [2048, 1, 1, 1]
-    //             block_1 = ggml_reshape_4d(ctx0, block_1, 1, 1, block_1->ne[0], block_1->ne[1]);
-    //             block_1 = ggml_mul(ctx0, block_1_hw, block_1);
+                // block_1 shape = [1, 2048, 12, 12], ne = [12, 12, 2048, 1]
+                // layer norm
+                block_1 = ggml_cont(ctx0, ggml_permute(ctx0, block_1, 1, 2, 0, 3));
+                // block_1 shape = [1, 12, 12, 2048], ne = [2048, 12, 12, 1]
+                block_1 = ggml_norm(ctx0, block_1, eps);
+                block_1 = ggml_add(ctx0, ggml_mul(ctx0, block_1, model.mm_model_block_2_block_0_1_w), model.mm_model_block_2_block_0_1_b);
+                block_1 = ggml_cont(ctx0, ggml_permute(ctx0, block_1, 2, 0, 1, 3));
+                // block_1 shape = [1, 2048, 12, 12], ne = [12, 12, 2048, 1]
+                // hardswish
+                struct ggml_tensor * block_1_hw = ggml_hardswish(ctx0, block_1);
 
-    //             int w = block_1->ne[0], h = block_1->ne[1];
-    //             block_1 = ggml_reshape_3d(ctx0, block_1, w*h, block_1->ne[2], block_1->ne[3]);
-    //             block_1 = ggml_cont(ctx0, ggml_permute(ctx0, block_1, 1, 0, 2, 3));
+                // not sure the parameters is right for globalAvgPooling
+                block_1 = ggml_pool_2d(ctx0, block_1_hw, GGML_OP_POOL_AVG, block_1_hw->ne[0], block_1_hw->ne[1], block_1_hw->ne[0], block_1_hw->ne[1], 0, 0);
+                // block_1 shape = [1, 2048, 1, 1], ne = [1, 1, 2048, 1]
+                // pointwise conv
+                block_1 = ggml_reshape_2d(ctx0, block_1, block_1->ne[0]*block_1->ne[1]*block_1->ne[2], block_1->ne[3]);
+                block_1 = ggml_mul_mat(ctx0, model.mm_model_block_2_block_1_fc1_w, block_1);
+                block_1 = ggml_add(ctx0, block_1, model.mm_model_block_2_block_1_fc1_b);
+                block_1 = ggml_relu(ctx0, block_1);
+                block_1 = ggml_mul_mat(ctx0, model.mm_model_block_2_block_1_fc2_w, block_1);
+                block_1 = ggml_add(ctx0, block_1, model.mm_model_block_2_block_1_fc2_b);
+                block_1 = ggml_hardsigmoid(ctx0, block_1);
 
-    //             // block_1 shape = [1, 24*24, 2048], ne = [24*24, 2048, 1]
-    //             block_1 = ggml_mul_mat(ctx0, model.mm_model_block_1_block_2_0_w, block_1);
-    //             block_1 = ggml_reshape_4d(ctx0, block_1, block_1->ne[0], w, h, block_1->ne[3]);
+                // block_1_hw shape = [1, 2048, 12, 12], ne = [12, 12, 2048, 1], block_1 shape = [1, 2048, 1, 1], ne = [1, 1, 2048, 1]
+                block_1 = ggml_reshape_4d(ctx0, block_1, 1, 1, block_1->ne[0], block_1->ne[1]);
+                block_1 = ggml_mul(ctx0, block_1_hw, block_1);
 
-    //             // block_1 shape = [1, 24, 24, 2048], ne = [2048, 24, 24, 1]
-    //             block_1 = ggml_norm(ctx0, block_1, eps);
-    //             block_1 = ggml_add(ctx0, ggml_mul(ctx0, block_1, model.mm_model_block_1_block_2_1_w), model.mm_model_block_1_block_2_1_b);
-    //             block_1 = ggml_cont(ctx0, ggml_permute(ctx0, block_1, 2, 0, 1, 3));
-    //             // block1 shape = [1, 2048, 24, 24], ne = [24, 24, 2048, 1]
-    //             // residual
-    //             block_1 = ggml_add(ctx0, mlp_3, block_1);
-    //         }
-
-    //         // block_2
-    //         {
-    //             // stride = 2
-    //             block_1 = ggml_conv_depthwise_2d(ctx0, model.mm_model_block_2_block_0_0_w, block_1, 2, 2, 1, 1, 1, 1);
-
-    //             // block_1 shape = [1, 2048, 12, 12], ne = [12, 12, 2048, 1]
-    //             // layer norm
-    //             block_1 = ggml_cont(ctx0, ggml_permute(ctx0, block_1, 1, 2, 0, 3));
-    //             // block_1 shape = [1, 12, 12, 2048], ne = [2048, 12, 12, 1]
-    //             block_1 = ggml_norm(ctx0, block_1, eps);
-    //             block_1 = ggml_add(ctx0, ggml_mul(ctx0, block_1, model.mm_model_block_2_block_0_1_w), model.mm_model_block_2_block_0_1_b);
-    //             block_1 = ggml_cont(ctx0, ggml_permute(ctx0, block_1, 2, 0, 1, 3));
-    //             // block_1 shape = [1, 2048, 12, 12], ne = [12, 12, 2048, 1]
-    //             // hardswish
-    //             struct ggml_tensor * block_1_hw = ggml_hardswish(ctx0, block_1);
-
-    //             // not sure the parameters is right for globalAvgPooling
-    //             block_1 = ggml_pool_2d(ctx0, block_1_hw, GGML_OP_POOL_AVG, block_1_hw->ne[0], block_1_hw->ne[1], block_1_hw->ne[0], block_1_hw->ne[1], 0, 0);
-    //             // block_1 shape = [1, 2048, 1, 1], ne = [1, 1, 2048, 1]
-    //             // pointwise conv
-    //             block_1 = ggml_reshape_2d(ctx0, block_1, block_1->ne[0]*block_1->ne[1]*block_1->ne[2], block_1->ne[3]);
-    //             block_1 = ggml_mul_mat(ctx0, model.mm_model_block_2_block_1_fc1_w, block_1);
-    //             block_1 = ggml_add(ctx0, block_1, model.mm_model_block_2_block_1_fc1_b);
-    //             block_1 = ggml_relu(ctx0, block_1);
-    //             block_1 = ggml_mul_mat(ctx0, model.mm_model_block_2_block_1_fc2_w, block_1);
-    //             block_1 = ggml_add(ctx0, block_1, model.mm_model_block_2_block_1_fc2_b);
-    //             block_1 = ggml_hardsigmoid(ctx0, block_1);
-
-    //             // block_1_hw shape = [1, 2048, 12, 12], ne = [12, 12, 2048, 1], block_1 shape = [1, 2048, 1, 1], ne = [1, 1, 2048, 1]
-    //             block_1 = ggml_reshape_4d(ctx0, block_1, 1, 1, block_1->ne[0], block_1->ne[1]);
-    //             block_1 = ggml_mul(ctx0, block_1_hw, block_1);
-
-    //             int w = block_1->ne[0], h = block_1->ne[1];
-    //             block_1 = ggml_reshape_3d(ctx0, block_1, w*h, block_1->ne[2], block_1->ne[3]);
-    //             block_1 = ggml_cont(ctx0, ggml_permute(ctx0, block_1, 1, 0, 2, 3));
-    //             // block_1 shape = [1, 24*24, 2048], ne = [24*24, 2048, 1]
-    //             block_1 = ggml_mul_mat(ctx0, model.mm_model_block_2_block_2_0_w, block_1);
-    //             block_1 = ggml_reshape_4d(ctx0, block_1, block_1->ne[0], w, h, block_1->ne[3]);
+                int w = block_1->ne[0], h = block_1->ne[1];
+                block_1 = ggml_reshape_3d(ctx0, block_1, w*h, block_1->ne[2], block_1->ne[3]);
+                block_1 = ggml_cont(ctx0, ggml_permute(ctx0, block_1, 1, 0, 2, 3));
+                // block_1 shape = [1, 24*24, 2048], ne = [24*24, 2048, 1]
+                block_1 = ggml_mul_mat(ctx0, model.mm_model_block_2_block_2_0_w, block_1);
+                block_1 = ggml_reshape_4d(ctx0, block_1, block_1->ne[0], w, h, block_1->ne[3]);
 
 
-    //             // block_1 shape = [1, 12, 12, 2048], ne = [2048, 12, 12, 1]
-    //             block_1 = ggml_norm(ctx0, block_1, eps);
-    //             block_1 = ggml_add(ctx0, ggml_mul(ctx0, block_1, model.mm_model_block_2_block_2_1_w), model.mm_model_block_2_block_2_1_b);
-    //             block_1 = ggml_reshape_3d(ctx0, block_1, block_1->ne[0], block_1->ne[1] * block_1->ne[2], block_1->ne[3]);
-    //             // block_1 shape = [1, 144, 2048], ne = [2048, 144, 1]
-    //         }
-    //         embeddings = block_1;
-    //     }
-    //     else if (ctx->proj_type == PROJECTOR_TYPE_LDPV2)
-    //     {
-    //         int n_patch = 24;
-    //         struct ggml_tensor * mlp_0 = ggml_mul_mat(ctx0, model.mm_model_mlp_0_w, embeddings);
-    //         mlp_0 = ggml_add(ctx0, mlp_0, model.mm_model_mlp_0_b);
-    //         mlp_0 = ggml_gelu(ctx0, mlp_0);
-    //         struct ggml_tensor * mlp_2 = ggml_mul_mat(ctx0, model.mm_model_mlp_2_w, mlp_0);
-    //         mlp_2 = ggml_add(ctx0, mlp_2, model.mm_model_mlp_2_b);
-    //         // mlp_2 ne = [2048, 576, 1, 1]
-    //         // // AVG Pool Layer 2*2, strides = 2
-    //         mlp_2 = ggml_cont(ctx0, ggml_permute(ctx0, mlp_2, 1, 0, 2, 3));
-    //         // mlp_2 ne = [576, 2048, 1, 1]
-    //         mlp_2 = ggml_reshape_4d(ctx0, mlp_2, n_patch, n_patch, mlp_2->ne[1], mlp_2->ne[2]);
-    //         // mlp_2 ne [24, 24, 2048, 1]
-    //         mlp_2 = ggml_pool_2d(ctx0, mlp_2, GGML_OP_POOL_AVG, 2, 2, 2, 2, 0, 0);
-    //         // weight ne = [3, 3, 2048, 1]
-    //         struct ggml_tensor * peg_0 = ggml_conv_depthwise_2d(ctx0, model.mm_model_peg_0_w, mlp_2, 1, 1, 1, 1, 1, 1);
-    //         peg_0 = ggml_cont(ctx0, ggml_permute(ctx0, peg_0, 1, 2, 0, 3));
-    //         peg_0 = ggml_add(ctx0, peg_0, model.mm_model_peg_0_b);
-    //         mlp_2 = ggml_cont(ctx0, ggml_permute(ctx0, mlp_2, 1, 2, 0, 3));
-    //         peg_0 = ggml_add(ctx0, peg_0, mlp_2);
-    //         peg_0 = ggml_reshape_3d(ctx0, peg_0, peg_0->ne[0], peg_0->ne[1] * peg_0->ne[2], peg_0->ne[3]);
-    //         embeddings = peg_0;
-    //     }
-    //     else if (ctx->proj_type == PROJECTOR_TYPE_RESAMPLER) {
-    //         struct ggml_tensor * q = model.mm_model_query;
-    //         { // layernorm
-    //             q = ggml_norm(ctx0, q, eps);
-    //             q = ggml_add(ctx0, ggml_mul(ctx0, q, model.mm_model_ln_q_w), model.mm_model_ln_q_b);
-    //         }
-    //         struct ggml_tensor *k, *v = ggml_mul_mat(ctx0, model.mm_model_kv_proj, embeddings);
-    //         { // layernorm
-    //             v = ggml_norm(ctx0, v, eps);
-    //             v = ggml_add(ctx0, ggml_mul(ctx0, v, model.mm_model_ln_kv_w), model.mm_model_ln_kv_b);
-    //         }
-    //         { // position
-    //             // q = ggml_add(ctx0, q, model.mm_model_pos_embed);
-    //             k = ggml_add(ctx0, v, pos_embed);
-    //         }
+                // block_1 shape = [1, 12, 12, 2048], ne = [2048, 12, 12, 1]
+                block_1 = ggml_norm(ctx0, block_1, eps);
+                block_1 = ggml_add(ctx0, ggml_mul(ctx0, block_1, model.mm_model_block_2_block_2_1_w), model.mm_model_block_2_block_2_1_b);
+                block_1 = ggml_reshape_3d(ctx0, block_1, block_1->ne[0], block_1->ne[1] * block_1->ne[2], block_1->ne[3]);
+                // block_1 shape = [1, 144, 2048], ne = [2048, 144, 1]
+            }
+            embeddings = block_1;
+        }
+        else if (ctx->proj_type == PROJECTOR_TYPE_LDPV2)
+        {
+            int n_patch = 24;
+            struct ggml_tensor * mlp_0 = ggml_mul_mat(ctx0, model.mm_model_mlp_0_w, embeddings);
+            mlp_0 = ggml_add(ctx0, mlp_0, model.mm_model_mlp_0_b);
+            mlp_0 = ggml_gelu(ctx0, mlp_0);
+            struct ggml_tensor * mlp_2 = ggml_mul_mat(ctx0, model.mm_model_mlp_2_w, mlp_0);
+            mlp_2 = ggml_add(ctx0, mlp_2, model.mm_model_mlp_2_b);
+            // mlp_2 ne = [2048, 576, 1, 1]
+            // // AVG Pool Layer 2*2, strides = 2
+            mlp_2 = ggml_cont(ctx0, ggml_permute(ctx0, mlp_2, 1, 0, 2, 3));
+            // mlp_2 ne = [576, 2048, 1, 1]
+            mlp_2 = ggml_reshape_4d(ctx0, mlp_2, n_patch, n_patch, mlp_2->ne[1], mlp_2->ne[2]);
+            // mlp_2 ne [24, 24, 2048, 1]
+            mlp_2 = ggml_pool_2d(ctx0, mlp_2, GGML_OP_POOL_AVG, 2, 2, 2, 2, 0, 0);
+            // weight ne = [3, 3, 2048, 1]
+            struct ggml_tensor * peg_0 = ggml_conv_depthwise_2d(ctx0, model.mm_model_peg_0_w, mlp_2, 1, 1, 1, 1, 1, 1);
+            peg_0 = ggml_cont(ctx0, ggml_permute(ctx0, peg_0, 1, 2, 0, 3));
+            peg_0 = ggml_add(ctx0, peg_0, model.mm_model_peg_0_b);
+            mlp_2 = ggml_cont(ctx0, ggml_permute(ctx0, mlp_2, 1, 2, 0, 3));
+            peg_0 = ggml_add(ctx0, peg_0, mlp_2);
+            peg_0 = ggml_reshape_3d(ctx0, peg_0, peg_0->ne[0], peg_0->ne[1] * peg_0->ne[2], peg_0->ne[3]);
+            embeddings = peg_0;
+        }
+        else if (ctx->proj_type == PROJECTOR_TYPE_RESAMPLER) {
+            struct ggml_tensor * q = model.mm_model_query;
+            { // layernorm
+                q = ggml_norm(ctx0, q, eps);
+                q = ggml_add(ctx0, ggml_mul(ctx0, q, model.mm_model_ln_q_w), model.mm_model_ln_q_b);
+            }
+            struct ggml_tensor *k, *v = ggml_mul_mat(ctx0, model.mm_model_kv_proj, embeddings);
+            { // layernorm
+                v = ggml_norm(ctx0, v, eps);
+                v = ggml_add(ctx0, ggml_mul(ctx0, v, model.mm_model_ln_kv_w), model.mm_model_ln_kv_b);
+            }
+            { // position
+                // q = ggml_add(ctx0, q, model.mm_model_pos_embed);
+                k = ggml_add(ctx0, v, pos_embed);
+            }
 
-    //         { // attention
-    //             const int hidden_size = 4096;
-    //             const int d_head = 128;
-    //             const int n_head = hidden_size/d_head;
-    //             const int num_query = 96;
+            { // attention
+                const int hidden_size = 4096;
+                const int d_head = 128;
+                const int n_head = hidden_size/d_head;
+                const int num_query = 96;
 
-    //             struct ggml_tensor * Q = ggml_add(ctx0, ggml_mul_mat(ctx0, model.mm_model_attn_q_w, q), model.mm_model_attn_q_b);
-    //             Q = ggml_scale_inplace(ctx0, Q, 1.0f / sqrt((float)d_head));
-    //             struct ggml_tensor * K = ggml_add(ctx0, ggml_mul_mat(ctx0, model.mm_model_attn_k_w, k), model.mm_model_attn_k_b);
-    //             struct ggml_tensor * V = ggml_add(ctx0, ggml_mul_mat(ctx0, model.mm_model_attn_v_w, v), model.mm_model_attn_v_b);
-    //             // permute
-    //             Q = ggml_reshape_4d(ctx0, Q, d_head, n_head, num_query, batch_size);
-    //             Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
-    //             Q = ggml_reshape_3d(ctx0, Q, d_head, num_query, n_head * batch_size);
-    //             K = ggml_reshape_4d(ctx0, K, d_head, n_head, num_positions, batch_size);
-    //             K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
-    //             K = ggml_reshape_3d(ctx0, K, d_head, num_positions, n_head * batch_size);
-    //             V = ggml_reshape_4d(ctx0, V, d_head, n_head, num_positions, batch_size);
-    //             V = ggml_cont(ctx0, ggml_permute(ctx0, V, 1, 2, 0, 3));
-    //             V = ggml_reshape_3d(ctx0, V, num_positions, d_head, n_head * batch_size);
-    //             struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
-    //             KQ = ggml_soft_max_inplace(ctx0, KQ);
-    //             struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ);
-    //             KQV = ggml_reshape_4d(ctx0, KQV, d_head, num_query, n_head, batch_size);
-    //             KQV = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
-    //             KQV = ggml_cont_3d(ctx0, KQV, hidden_size, num_query, batch_size);
+                struct ggml_tensor * Q = ggml_add(ctx0, ggml_mul_mat(ctx0, model.mm_model_attn_q_w, q), model.mm_model_attn_q_b);
+                Q = ggml_scale_inplace(ctx0, Q, 1.0f / sqrt((float)d_head));
+                struct ggml_tensor * K = ggml_add(ctx0, ggml_mul_mat(ctx0, model.mm_model_attn_k_w, k), model.mm_model_attn_k_b);
+                struct ggml_tensor * V = ggml_add(ctx0, ggml_mul_mat(ctx0, model.mm_model_attn_v_w, v), model.mm_model_attn_v_b);
+                // permute
+                Q = ggml_reshape_4d(ctx0, Q, d_head, n_head, num_query, batch_size);
+                Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
+                Q = ggml_reshape_3d(ctx0, Q, d_head, num_query, n_head * batch_size);
+                K = ggml_reshape_4d(ctx0, K, d_head, n_head, num_positions, batch_size);
+                K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
+                K = ggml_reshape_3d(ctx0, K, d_head, num_positions, n_head * batch_size);
+                V = ggml_reshape_4d(ctx0, V, d_head, n_head, num_positions, batch_size);
+                V = ggml_cont(ctx0, ggml_permute(ctx0, V, 1, 2, 0, 3));
+                V = ggml_reshape_3d(ctx0, V, num_positions, d_head, n_head * batch_size);
+                struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
+                KQ = ggml_soft_max_inplace(ctx0, KQ);
+                struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ);
+                KQV = ggml_reshape_4d(ctx0, KQV, d_head, num_query, n_head, batch_size);
+                KQV = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
+                KQV = ggml_cont_3d(ctx0, KQV, hidden_size, num_query, batch_size);
 
-    //             embeddings = ggml_add(ctx0, ggml_mul_mat(ctx0, model.mm_model_attn_o_w, KQV), model.mm_model_attn_o_b);
-    //         }
-    //         { // layernorm
-    //             embeddings = ggml_norm(ctx0, embeddings, eps);
-    //             embeddings = ggml_add(ctx0, ggml_mul(ctx0, embeddings, model.mm_model_ln_post_w), model.mm_model_ln_post_b);
-    //         }
-    //         embeddings = ggml_mul_mat(ctx0, model.mm_model_proj, embeddings);
-    //     }
-    //     else {
-    //         GGML_ASSERT(false);
-    //     }
-    // }
+                embeddings = ggml_add(ctx0, ggml_mul_mat(ctx0, model.mm_model_attn_o_w, KQV), model.mm_model_attn_o_b);
+            }
+            { // layernorm
+                embeddings = ggml_norm(ctx0, embeddings, eps);
+                embeddings = ggml_add(ctx0, ggml_mul(ctx0, embeddings, model.mm_model_ln_post_w), model.mm_model_ln_post_b);
+            }
+            embeddings = ggml_mul_mat(ctx0, model.mm_model_proj, embeddings);
+        }
+        else {
+            GGML_ASSERT(false);
+        }
+    }
 
     // build the graph
     // ggml_build_forward_expand(gf, embeddings);
